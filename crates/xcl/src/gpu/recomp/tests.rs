@@ -8422,6 +8422,16 @@ fn ds_permute_reference_matches_rdna2_values() {
 
 #[test]
 fn gpu_ds_permute_b32() {
+    gpu_ds_permute_b32_with(false);
+}
+
+/// The direct DXIL translator's `ds_permute_b32`, whatever `XCL_DIRECT_DXIL` says.
+#[test]
+fn gpu_ds_permute_b32_direct() {
+    gpu_ds_permute_b32_with(true);
+}
+
+fn gpu_ds_permute_b32_with(direct: bool) {
     let run_case = |wave64: bool, split_wave64: bool| {
         let lanes = if wave64 { 64 } else { 32 };
         let exec: u64 = if wave64 { 0xF0F0_FF0F_7777_FFFE } else { 0x7777_FFFE };
@@ -8442,9 +8452,14 @@ fn gpu_ds_permute_b32() {
             ("DS_PERMUTE_B32", "ENC_DS", &[("VDST", 14), ("ADDR", 4), ("DATA0", 0), ("OFFSET0", 2)], None),
         ]);
         let code = prog(&insns);
-        let t = translate(&code, &Options { wave64, split_wave64, ..Default::default() }).unwrap();
-        assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
-        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let dxil = if direct {
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: 1, sampler_base: 0 };
+            crate::gpu::dxil::kernel::translate(&code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}"))
+        } else {
+            let t = translate(&code, &Options { wave64, split_wave64, ..Default::default() }).unwrap();
+            assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl))
+        };
         let mut st = KernelState::default();
         let (mut data, mut a1, mut a2, mut a3, mut a4) = (vec![], vec![], vec![], vec![], vec![]);
         for l in 0..lanes {
@@ -8470,7 +8485,7 @@ fn gpu_ds_permute_b32() {
         ];
         for l in 0..lanes {
             for (k, w) in want.iter().enumerate() {
-                assert_eq!(r.vgpr[l][10 + k], w[l], "wave{lanes} split={split_wave64} lane {l}: v{}", 10 + k);
+                assert_eq!(r.vgpr[l][10 + k], w[l], "direct={direct} wave{lanes} split={split_wave64} lane {l}: v{}", 10 + k);
             }
         }
     };
