@@ -2610,4 +2610,225 @@ void main() {
             assert_eq!(got, vec![shade(1), shade(2), 0], "clamped to mip 1; clamped from the resource's mip 0 (mip 2, not 3); mip 0 unmapped reads zero");
         }
     }
+
+    /// The picture a texture without its top mip gives, filtered: 64x64 samples with trilinear and
+    /// 16x anisotropic filtering, over level of detail -3 to +3 and anisotropy 1 to 16 (gradients
+    /// given), from two copies of one 256x256 texture with nine mips. In both, mip 0 holds a
+    /// poison colour (red) that no other mip has. One copy has mip 0 left out (no pages) and its
+    /// view clamped; the other has every mip in memory and the same clamp. The two pictures are
+    /// the same to the bit, and neither has any red: the left-out mip adds nothing to any pixel
+    /// (not even a filter tap reading zeros), so the texture looks the way the clamp alone makes
+    /// it look. Without the clamp the same samples do show red (the picture reaches mip 0).
+    #[test]
+    fn gpu_a_texture_without_its_top_mip_filters_like_the_clamp_alone() {
+        use std::mem::{transmute_copy, ManuallyDrop};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let skip = crate::gpu::recomp::runner::skip_test;
+        let dev = unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return skip("no DXGI") };
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let Some((a, d)) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next() else { return skip("no GPU") };
+            let Ok(dev) = crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_12_0) else { return skip("no GPU") };
+            println!("adapter: {}", crate::gpu::adapter::name(&d));
+            dev
+        };
+        if !tier2(&dev) || crate::gpu::recomp::dxc::location().is_err() {
+            return skip("no tiled resources tier 2 or no DXC");
+        }
+        // views 0..3 (left out + clamp, all in memory + clamp, all in memory unclamped) x samplers
+        // (trilinear, anisotropic 16x): six pictures of N x N, RGBA8 packed
+        const N: u32 = 64;
+        let src = r#"
+#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), UAV(u0), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR), StaticSampler(s1, filter=FILTER_ANISOTROPIC, maxAnisotropy=16)"
+RWByteAddressBuffer outb : register(u0);
+SamplerState tri : register(s0);
+SamplerState aniso : register(s1);
+uint pack(float4 c) {
+    uint4 b = uint4(saturate(c) * 255.0 + 0.5);
+    return b.r | (b.g << 8) | (b.b << 16) | (b.a << 24);
+}
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    const uint N = 64;
+    float2 uv = (float2(id.xy) + 0.5) / N;
+    // level of detail -3 .. +3 down the picture, anisotropy 1 .. 16 across it
+    float scale = exp2(lerp(-3.0, 3.0, id.y / float(N - 1))) / 256.0;
+    float ratio = exp2(4.0 * id.x / float(N - 1));
+    // every other column turned 45 degrees: the footprint is not only along the axes
+    float2 major = (id.x & 1) ? float2(0.7071, 0.7071) : float2(1.0, 0.0);
+    float2 minor = float2(-major.y, major.x);
+    float2 ddx = major * scale * ratio;
+    float2 ddy = minor * scale;
+    for (uint v = 0; v < 3; v++) {
+        Texture2D<float4> t = ResourceDescriptorHeap[v];
+        uint at = ((v * 2) * N * N + id.y * N + id.x) * 4;
+        outb.Store(at, pack(t.SampleGrad(tri, uv, ddx, ddy)));
+        outb.Store(at + N * N * 4, pack(t.SampleGrad(aniso, uv, ddx, ddy)));
+    }
+}
+"#;
+        const MIPS: u16 = 9;
+        const PICTURES: usize = 6;
+        let bytes = (PICTURES as u32 * N * N * 4) as u64;
+        // mip 0: red (the poison); mips 1..8: no red, a checker of 4x4 texels in green and blue
+        // that differs from mip to mip, so filtering between mips changes the picture
+        let texel = |mip: u32, x: u32, y: u32| -> u32 {
+            if mip == 0 {
+                return 0xFF00_00FF;
+            }
+            let odd = ((x / 4) + (y / 4)) & 1;
+            let g = if odd == 1 { 255 - 24 * mip } else { 24 * mip };
+            let b = if odd == 1 { 40 } else { 200 };
+            0xFF00_0000 | (b << 16) | (g << 8)
+        };
+        unsafe {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: MIPS,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                ..Default::default()
+            };
+            let reserved = || {
+                let mut t: Option<ID3D12Resource> = None;
+                dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut t).unwrap();
+                t.unwrap()
+            };
+            let (left_out, whole) = (reserved(), reserved());
+            let mut total = 0u32;
+            dev.GetResourceTiling(&left_out, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+            let (standard, tilings) = mip_tilings(&dev, &left_out, &desc);
+            assert!(standard >= 1, "256x256 RGBA8 has mip 0 tiled ({standard})");
+            let mask = top_mip_mask(&desc, &tilings, total, 1);
+            let mip0 = u32::from(tilings[0].WidthInTiles) * u32::from(tilings[0].HeightInTiles);
+            assert_eq!(mask.iter().filter(|&&m| m).count() as u32, mip0, "exactly mip 0's tiles left out");
+
+            let mut pages = Pages::new(&dev).unwrap();
+            let (used, extra) = pages.bind(&dev, &left_out, 0x10_0000_0000, None, total, &mask).unwrap();
+            assert_eq!((used.len() + extra.len()) as u32, total - mip0, "mip 0 takes no page");
+            pages.bind(&dev, &whole, 0x20_0000_0000, None, total, &vec![false; total as usize]).unwrap();
+
+            let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); MIPS as usize];
+            let mut rows = vec![0u32; MIPS as usize];
+            let mut row_bytes = vec![0u64; MIPS as usize];
+            let mut upload_bytes = 0u64;
+            dev.GetCopyableFootprints(&desc, 0, u32::from(MIPS), 0, Some(layouts.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut upload_bytes));
+            let buffer = |size: u64, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, uav: bool| {
+                let d = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: size,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: if uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let upload = buffer(upload_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+            let mut p = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut p)).unwrap();
+            for (m, l) in layouts.iter().enumerate() {
+                for y in 0..rows[m] {
+                    let at = (p as *mut u8).add(l.Offset as usize + y as usize * l.Footprint.RowPitch as usize) as *mut u32;
+                    for x in 0..l.Footprint.Width {
+                        at.add(x as usize).write_unaligned(texel(m as u32, x, y));
+                    }
+                }
+            }
+            upload.Unmap(0, None);
+
+            let dxil = crate::gpu::recomp::dxc::compile(src, "main", "cs_6_6", &[]).unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+            let pso: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let dh: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 3, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 })
+                .unwrap();
+            let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let view = |skipped: u32| {
+                let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: desc.Format,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: u32::MAX, ..Default::default() } },
+                };
+                if skipped > 0 {
+                    clamp_skipped_mips(&mut v, skipped);
+                }
+                v
+            };
+            for (i, (t, v)) in [(&left_out, view(1)), (&whole, view(1)), (&whole, view(0))].into_iter().enumerate() {
+                let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dh.GetCPUDescriptorHandleForHeapStart().ptr + i * inc };
+                dev.CreateShaderResourceView(t, Some(&v), at);
+            }
+            let out = buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+            let rb = buffer(bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            queue.Wait(&pages.fence, pages.value).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).unwrap();
+            for t in [&left_out, &whole] {
+                for (m, l) in layouts.iter().enumerate() {
+                    let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(t), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: m as u32 } };
+                    let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&upload), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *l } };
+                    list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                }
+            }
+            let barrier = |r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES| D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: transmute_copy(r), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: before, StateAfter: after }),
+                },
+            };
+            let to_read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            list.ResourceBarrier(&[barrier(&left_out, D3D12_RESOURCE_STATE_COPY_DEST, to_read), barrier(&whole, D3D12_RESOURCE_STATE_COPY_DEST, to_read)]);
+            list.SetDescriptorHeaps(&[Some(dh.clone())]);
+            list.SetComputeRootSignature(&rs);
+            list.SetComputeRootUnorderedAccessView(0, out.GetGPUVirtualAddress());
+            list.Dispatch(N / 8, N / 8, 1);
+            list.ResourceBarrier(&[barrier(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyBufferRegion(&rb, 0, &out, 0, bytes);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, &dev, None, 20_000).map_err(|e| format!("{e}")).unwrap();
+            let mut q = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut q)).unwrap();
+            let all = std::slice::from_raw_parts(q as *const u32, PICTURES * (N * N) as usize).to_vec();
+            rb.Unmap(0, None);
+
+            let n = (N * N) as usize;
+            let picture = |v: usize, sampler: usize| &all[(v * 2 + sampler) * n..(v * 2 + sampler + 1) * n];
+            let red = |px: &[u32]| px.iter().filter(|&&c| c & 0xFF != 0).count();
+            for (sampler, name) in [(0, "trilinear"), (1, "anisotropic 16x")] {
+                let (cut, clamped, unclamped) = (picture(0, sampler), picture(1, sampler), picture(2, sampler));
+                let differ = cut.iter().zip(clamped).filter(|(a, b)| a != b).count();
+                println!("{name}: {differ} of {n} pixels differ; red in: left out {}, clamp alone {}, unclamped {}", red(cut), red(clamped), red(unclamped));
+                assert!(red(unclamped) > 0, "{name}: the samples reach mip 0 without the clamp (else this test shows nothing)");
+                assert!(cut.iter().any(|&c| c & 0x00FF_FF00 != 0), "{name}: the texture without mip 0 is not black");
+                assert_eq!(red(clamped), 0, "{name}: the clamp alone keeps mip 0 out of every pixel");
+                assert_eq!(differ, 0, "{name}: without mip 0 in memory the picture is the clamp's, to the bit");
+            }
+        }
+    }
 }
