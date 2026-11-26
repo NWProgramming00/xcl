@@ -760,6 +760,35 @@ mod used_tests {
         let _ = released(standin);
     }
 
+    /// A build a submit will wait for is wanted from the call put off to the submit on, before the
+    /// submit waits: the huge-build gate then lets it through without waiting for commit headroom.
+    #[test]
+    fn a_pipeline_a_submit_needs_is_wanted_before_the_submit_waits() {
+        let standin = 0x7E57_B006usize;
+        let (started_tx, started) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel::<()>();
+        submit(standin, true, Box::new(move || {
+            let unwanted_first = !build_is_wanted();
+            started_tx.send(()).unwrap();
+            go.recv().unwrap();
+            let t = std::time::Instant::now();
+            while !build_is_wanted() && t.elapsed() < std::time::Duration::from_secs(3) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if unwanted_first && build_is_wanted() { 0x5555 } else { 0 }
+        }));
+        started.recv().unwrap();
+        need_by_submit(standin);
+        go_tx.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!is_pending(standin), "the build never finished");
+        assert_eq!(resolve_wait_for(standin, None), 0x5555, "a call put off to the submit did not make its build wanted");
+        let _ = released(standin);
+    }
+
     /// A worker's build hears that a bind waits for it (and only its own build does).
     #[test]
     fn a_waiting_bind_makes_the_build_wanted() {
@@ -1219,10 +1248,14 @@ pub fn want(pso: usize) {
     }
 }
 
-/// A call with `pso` was put off to the submit: its build goes before the workers' queue.
+/// A call with `pso` was put off to the submit: its build goes before the workers' queue, and it
+/// is wanted from now on, as the submit will wait for it. A huge build then takes a slot of the
+/// wanted cap without waiting for commit headroom, so put-off builds go on together instead of one
+/// at a time, each only once its submit waits for it.
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
     if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
+        p.want();
         NEEDED.lock().unwrap().push_back(p);
         let _ = queue().lock().unwrap().send(Box::new(|| ()));
     }
