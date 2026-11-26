@@ -2127,7 +2127,7 @@ impl Lw {
             // receiver looks at the 32 senders of its half in lane order (unrolled), through
             // `read_lane_half`, so the split form needs no exchange.
             "ds_permute_b32" => {
-                if self.wave64 && self.split && self.gfx.as_ref().is_some_and(|g| g.vs.is_some() || g.ps.is_some()) {
+                if self.gfx_split {
                     // a 32-lane wave stands for a console wave whose lanes 32..63 do not exist
                     return err(d, "ds_permute_b32 in a wave64 VS / PS that may run in 32-lane waves");
                 }

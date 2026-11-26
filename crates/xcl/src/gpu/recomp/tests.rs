@@ -8511,6 +8511,25 @@ fn ds_permute_b32_refused_where_upper_lanes_do_not_exist() {
     assert!(t.complete(), "{:?}", t.unsupported_why);
 }
 
+/// The direct translator refuses it in the same place: a wave64 VS / PS asked to split, i.e.
+/// for a GPU that may run it in 32-lane waves. Translated when it runs in 64-lane waves.
+#[test]
+fn ds_permute_b32_direct_refused_where_upper_lanes_do_not_exist() {
+    use super::{PsInterface, VsInterface};
+    use crate::gpu::dxil::kernel::{translate_pixel, translate_vertex, KernelOptions};
+    let code = prog(&[("DS_PERMUTE_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 1), ("DATA0", 0)], None)]);
+    let ps = PsInterface { inputs: vec![], outputs: vec![], input_ena: 0x7F, attrs: None };
+    let vs = VsInterface { inputs: vec![], outputs: vec![], attr_base: 4, params: None };
+    let o = |split| KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+    let refused = "ds_permute_b32 in a wave64 VS / PS";
+    let e = translate_pixel(&code, o(true), &ps).err().unwrap_or_default();
+    assert!(e.contains(refused), "PS: {e:?}");
+    let e = translate_vertex(&code, o(true), &vs).err().unwrap_or_default();
+    assert!(e.contains(refused), "VS: {e:?}");
+    translate_pixel(&code, o(false), &ps).unwrap_or_else(|e| panic!("PS: {e}"));
+    translate_vertex(&code, o(false), &vs).unwrap_or_else(|e| panic!("VS: {e}"));
+}
+
 #[test]
 fn gpu_ldexp_f32() {
     for wave64 in gpu_waves() {
