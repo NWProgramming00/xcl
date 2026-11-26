@@ -1022,7 +1022,7 @@ unsafe fn place_on_pages(
     };
     // sampled textures only: what the GPU renders to keeps all of its memory
     let (skip_mips, skip) = if require_aligned { (0, Vec::new()) } else { top_mip_tiles(dev, res, &tiled, total) };
-    let skip_tiles = skip.iter().filter(|&&s| s).count();
+    let skip_pages = if skip_mips > 0 { skipped_pages(va, console_bytes, total, &skip) } else { Vec::new() };
     let bound = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
@@ -1049,7 +1049,7 @@ unsafe fn place_on_pages(
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     if skip_mips > 0 {
-        note_skipped_mips(raw as usize, skip_mips, skip_tiles);
+        note_skipped_mips(raw as usize, skip_mips, skip_pages);
     }
     Some(hr)
 }
@@ -1347,16 +1347,27 @@ fn top_mip_mask(desc: &D3D12_RESOURCE_DESC, tilings: &[D3D12_SUBRESOURCE_TILING]
     mask
 }
 
-/// resource → (top mips it has no video memory for, tiles of them)
-static SKIPPED_MIPS: Mutex<Option<std::collections::HashMap<usize, (u32, usize)>>> = Mutex::new(None);
+/// A page a left-out tile would have had: (title page address, `usize::MAX`) for one of the
+/// texture's own pages, (its address, tile index) for an extra tile – as `Pages::bind` keys them.
+type SkippedPage = (usize, usize);
+
+/// resource → (top mips it has no video memory for, the pages of their tiles)
+type SkippedMips = std::collections::HashMap<usize, (u32, Vec<SkippedPage>)>;
+static SKIPPED_MIPS: Mutex<Option<SkippedMips>> = Mutex::new(None);
 /// whether any texture has (the views' fast path)
 static ANY_SKIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn note_skipped_mips(resource: usize, mips: u32, tiles: usize) {
+/// The pages of the tiles `skip` marks of a texture at `va` (`console_bytes`, `total` tiles).
+fn skipped_pages(va: usize, console_bytes: Option<u64>, total: u32, skip: &[bool]) -> Vec<SkippedPage> {
+    let Some((first, own)) = owned_pages(va, console_bytes, total as usize) else { return Vec::new() };
+    skip.iter().enumerate().filter(|&(_, &s)| s).map(|(i, _)| if i < own { (first + i * PAGE, usize::MAX) } else { (va, i) }).collect()
+}
+
+fn note_skipped_mips(resource: usize, mips: u32, pages: Vec<SkippedPage>) {
     let first = {
         let mut g = SKIPPED_MIPS.lock().unwrap();
         let m = g.get_or_insert_with(std::collections::HashMap::new);
-        m.insert(resource, (mips, tiles));
+        m.insert(resource, (mips, pages));
         !ANY_SKIPPED.swap(true, std::sync::atomic::Ordering::AcqRel)
     };
     if first {
@@ -1380,9 +1391,19 @@ pub(super) fn skipped_mips(resource: usize) -> u32 {
     SKIPPED_MIPS.lock().unwrap().as_ref().and_then(|m| m.get(&resource).map(|e| e.0)).unwrap_or(0)
 }
 
-/// (textures alive now without their top mips, bytes of tiles they go without) – `XCL_ACTIVITY`.
+/// (textures alive now without their top mips, bytes of the pages they left out that no texture
+/// has now) – `XCL_ACTIVITY`. A page textures at one address share counts once, and not at all
+/// while another texture there has it.
 pub fn skipped_textures() -> (u64, u64) {
-    SKIPPED_MIPS.lock().unwrap().as_ref().map_or((0, 0), |m| (m.len() as u64, m.values().map(|e| (e.1 * PAGE) as u64).sum()))
+    let (textures, wanted) = {
+        let g = SKIPPED_MIPS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return (0, 0) };
+        let wanted: HashSet<SkippedPage> = m.values().flat_map(|e| e.1.iter().copied()).collect();
+        (m.len() as u64, wanted)
+    };
+    let g = PAGES.lock().unwrap();
+    let held = |&(a, i): &SkippedPage| g.values().flatten().any(|p| if i == usize::MAX { p.pages.contains_key(&a) } else { p.extra_pages.contains_key(&(a, i)) });
+    (textures, (wanted.iter().filter(|k| !held(k)).count() * PAGE) as u64)
 }
 
 /// A texture view of a resource without its `mips` top mips: sampling clamped to the first mip
@@ -2380,6 +2401,22 @@ mod tests {
         lv.groups[2].3 = true;
         assert_eq!(groups_to_map(&lv, all.clone(), 2), vec![3, 4], "a group with pages is not mapped again");
         assert_eq!(groups_to_map(&lv, vec![0, 1], 2), Vec::<usize>::new(), "an upload of the left-out levels maps nothing");
+    }
+
+    /// The pages of left-out tiles are keyed as `Pages::bind` keys them, so two textures at one
+    /// address name the same pages (and `skipped_textures` counts them once).
+    #[test]
+    fn left_out_tiles_name_the_pages_bind_would_give_them() {
+        let (va, total) = (0x10_0000_0000usize, 6u32);
+        let skip = [true, true, false, false, false, false];
+        let a = skipped_pages(va, None, total, &skip);
+        assert_eq!(a, vec![(va, usize::MAX), (va + PAGE, usize::MAX)]);
+        assert_eq!(skipped_pages(va, None, total, &skip), a, "a second texture there: the same pages");
+        // a texture covering 2 pages of its own (from the next 64 KiB boundary): the rest are extra tiles
+        let at = va + 0x1000;
+        let b = skipped_pages(at, Some((2 * PAGE) as u64), total, &[false, true, true, false, false, false]);
+        assert_eq!(b, vec![(va + 2 * PAGE, usize::MAX), (at, 2)]);
+        assert!(skipped_pages(va, None, total, &[false; 6]).is_empty());
     }
 
     #[test]
